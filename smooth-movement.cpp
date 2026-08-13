@@ -19,10 +19,17 @@
 
 #include <algorithm>
 #include <array>
+#include <cassert>
 #include <cmath>
 #include <cstdint>
+#include <future>
+#include <limits>
+#include <memory>
+#include <mutex>
 #include <set>
+#include <stdexcept>
 #include <string>
+#include <thread>
 #include <type_traits>
 #include <unordered_map>
 #include <utility>
@@ -50,6 +57,45 @@ decltype(&SDL_RenderFillRect) render_fill_rect=nullptr;
 decltype(&SDL_RenderSetClipRect) render_set_clip_rect=nullptr;
 decltype(&SDL_GetRenderDrawColor) get_render_draw_color=nullptr;
 decltype(&SDL_SetRenderDrawColor) set_render_draw_color=nullptr;
+
+// Mutable render state is owned by the render thread. Plugin commands and lifecycle callbacks run
+// elsewhere, so they rendezvous with that thread before reading or changing it. This mutex only
+// serializes those rare transactions; the per-frame hook never takes it.
+std::mutex render_transaction_mutex;
+std::thread::id render_thread_id;
+bool has_render_thread_id=false;
+
+template<typename Callback>
+auto render_thread_transaction(Callback callback)
+{
+	using result_type=std::invoke_result_t<Callback>;
+	std::unique_lock<std::mutex> transaction(render_transaction_mutex);
+	if(has_render_thread_id&&render_thread_id==std::this_thread::get_id())
+		return callback();
+
+	auto task=std::make_shared<std::packaged_task<result_type()>>(
+		[callback=std::move(callback)]() mutable -> result_type
+			{
+			const std::thread::id current=std::this_thread::get_id();
+			if(!has_render_thread_id)
+				{
+				render_thread_id=current;
+				has_render_thread_id=true;
+				}
+			else if(render_thread_id!=current)
+				throw std::runtime_error("DFHack render thread changed");
+			return callback();
+			});
+	std::future<result_type> result=task->get_future();
+	DFHack::runOnRenderThread([task]{(*task)();});
+	return result.get();
+}
+
+void assert_render_thread()
+{
+	assert(has_render_thread_id);
+	assert(render_thread_id==std::this_thread::get_id());
+}
 
 visual_animation_managerst animation_manager;
 std::set<std::pair<int32_t,int32_t>> previous_coverage;
@@ -100,10 +146,16 @@ int32_t camera_prev_wx=0;                     // window-scroll observation basel
 int32_t camera_prev_wy=0;
 bool camera_has_prev=false;
 
+int32_t tile_size_px(int32_t zoom)
+{
+	const int64_t scaled=int64_t(zoom)*32/128;
+	return int32_t(std::clamp(
+		scaled,int64_t(1),int64_t(std::numeric_limits<int32_t>::max())));
+}
+
 double tile_px(const df::renderer_2d_base *renderer)
 {
-	const int32_t zoom=renderer->viewport_zoom_factor;
-	return double(zoom==128?32:std::max(1,zoom*32/128));
+	return double(tile_size_px(renderer->viewport_zoom_factor));
 }
 
 // Match ratio of "buffers shifted by (dwx,dwy)" on the background layer: 0..1, or -1 when there
@@ -164,17 +216,36 @@ void set_camera_enabled(bool enable)
 // visual position is unchanged: the window write is attributed via self_scroll when it lands.
 void normalize_rest()
 {
+	const double limit=double(std::numeric_limits<int32_t>::max());
+	if(!std::isfinite(rest_x)||!std::isfinite(rest_y)||
+		std::abs(rest_x)>limit||std::abs(rest_y)>limit)
+		{
+		rest_x=0.0;
+		rest_y=0.0;
+		cancel_camera_transients();
+		return;
+		}
 	const int32_t kx=int32_t(-std::llround(rest_x));
 	const int32_t ky=int32_t(-std::llround(rest_y));
-	if(kx!=0&&window_x!=nullptr&&*window_x+kx>=0)
+	const int64_t new_window_x=window_x?int64_t(*window_x)+kx:-1;
+	const int64_t new_window_y=window_y?int64_t(*window_y)+ky:-1;
+	if(kx!=0&&window_x!=nullptr&&new_window_x>=0&&
+		new_window_x<=std::numeric_limits<int32_t>::max())
 		{
-		*window_x+=kx;
-		self_scroll_x+=kx;
+		*window_x=int32_t(new_window_x);
+		self_scroll_x=int32_t(std::clamp(
+			int64_t(self_scroll_x)+kx,
+			int64_t(std::numeric_limits<int32_t>::min()),
+			int64_t(std::numeric_limits<int32_t>::max())));
 		}
-	if(ky!=0&&window_y!=nullptr&&*window_y+ky>=0)
+	if(ky!=0&&window_y!=nullptr&&new_window_y>=0&&
+		new_window_y<=std::numeric_limits<int32_t>::max())
 		{
-		*window_y+=ky;
-		self_scroll_y+=ky;
+		*window_y=int32_t(new_window_y);
+		self_scroll_y=int32_t(std::clamp(
+			int64_t(self_scroll_y)+ky,
+			int64_t(std::numeric_limits<int32_t>::min()),
+			int64_t(std::numeric_limits<int32_t>::max())));
 		}
 }
 
@@ -491,12 +562,61 @@ viewport_visual_animation_inputst animation_input(df::graphic_viewportst *vp)
 // The layer buffers are freed and nulled without clearing the active flag.
 bool viewport_readable(df::graphic_viewportst *vp)
 {
-	return vp!=nullptr&&vp->flag.bits.active&&animation_input(vp).valid();
+	return vp!=nullptr&&vp->flag.bits.active&&animation_input(vp).valid()&&
+		vp->clipx[0]>=0&&vp->clipx[0]<=vp->clipx[1]&&vp->clipx[1]<vp->dim_x&&
+		vp->clipy[0]>=0&&vp->clipy[0]<=vp->clipy[1]&&vp->clipy[1]<vp->dim_y&&
+		vp->screentexpos_background!=nullptr&&
+		vp->screentexpos_background_old!=nullptr&&
+		vp->screentexpos_floor_flag!=nullptr&&
+		vp->screentexpos_background_two!=nullptr&&
+		vp->screentexpos_liquid_flag!=nullptr&&
+		vp->screentexpos_spatter_flag!=nullptr&&
+		vp->screentexpos_spatter!=nullptr&&
+		vp->screentexpos_ramp_flag!=nullptr&&
+		vp->screentexpos_shadow_flag!=nullptr&&
+		vp->screentexpos_building_one!=nullptr&&
+		vp->screentexpos_vermin!=nullptr&&
+		vp->screentexpos_building_two!=nullptr&&
+		vp->screentexpos_projectile!=nullptr&&
+		vp->screentexpos_high_flow!=nullptr&&
+		vp->screentexpos_top_shadow!=nullptr&&
+		vp->screentexpos_signpost!=nullptr;
 }
 
 int32_t tile_pixel(int32_t tile,int32_t origin,int32_t zoom)
 {
-	return zoom==128?32*tile+origin:(zoom*32*tile)/128+origin;
+	// Algebraically this is the renderer's (zoom*32*tile)/128+origin, but the
+	// reordered expression cannot overflow int64_t for int32_t inputs.
+	const int64_t pixel=(int64_t(zoom)*tile)/4+origin;
+	return int32_t(std::clamp(
+		pixel,
+		int64_t(std::numeric_limits<int32_t>::min()),
+		int64_t(std::numeric_limits<int32_t>::max())));
+}
+
+int32_t saturated_pixel_span(int32_t first,int32_t last)
+{
+	return int32_t(std::clamp(
+		int64_t(last)-first,
+		int64_t(0),
+		int64_t(std::numeric_limits<int32_t>::max())));
+}
+
+int32_t saturated_add(int32_t first,int32_t second)
+{
+	return int32_t(std::clamp(
+		int64_t(first)+second,
+		int64_t(std::numeric_limits<int32_t>::min()),
+		int64_t(std::numeric_limits<int32_t>::max())));
+}
+
+bool rounded_pixel_offset(double value,int32_t &result)
+{
+	if(!std::isfinite(value)||
+		value<double(std::numeric_limits<int32_t>::min())||
+		value>double(std::numeric_limits<int32_t>::max()))return false;
+	result=int32_t(std::lround(value));
+	return true;
 }
 
 bool inside_clip(const df::graphic_viewportst *vp,int32_t x,int32_t y)
@@ -507,8 +627,7 @@ bool inside_clip(const df::graphic_viewportst *vp,int32_t x,int32_t y)
 
 bool has_fire(const df::graphic_viewportst *vp,int32_t x,int32_t y)
 {
-	return vp->screentexpos_spatter_flag!=nullptr&&
-		(vp->screentexpos_spatter_flag[x*vp->dim_y+y]&fire_bits)!=0;
+	return (vp->screentexpos_spatter_flag[x*vp->dim_y+y]&fire_bits)!=0;
 }
 
 template<typename T>
@@ -682,27 +801,6 @@ void redraw_viewport_tile(
 	else with_zeroed_values(stage,vp->screentexpos_interface[index]);
 }
 
-// Every buffer the interface-only pass zeroes has to exist before it can be zeroed.
-bool interface_pass_readable(const df::graphic_viewportst *vp)
-{
-	return vp!=nullptr&&
-		vp->screentexpos_interface!=nullptr&&
-		vp->screentexpos_background!=nullptr&&
-		vp->screentexpos_floor_flag!=nullptr&&
-		vp->screentexpos_background_two!=nullptr&&
-		vp->screentexpos_liquid_flag!=nullptr&&
-		vp->screentexpos_spatter_flag!=nullptr&&
-		vp->screentexpos_spatter!=nullptr&&
-		vp->screentexpos_ramp_flag!=nullptr&&
-		vp->screentexpos_shadow_flag!=nullptr&&
-		vp->screentexpos_building_one!=nullptr&&
-		vp->screentexpos_vermin!=nullptr&&
-		vp->screentexpos_building_two!=nullptr&&
-		vp->screentexpos_projectile!=nullptr&&
-		vp->screentexpos_high_flow!=nullptr&&
-		vp->screentexpos_signpost!=nullptr;
-}
-
 // Runs after the proxies so the shading covers them rather than sitting underneath.
 void draw_interface_only(
 	df::renderer_2d_base *renderer,
@@ -710,7 +808,8 @@ void draw_interface_only(
 	int32_t x,
 	int32_t y)
 {
-	if(!interface_pass_readable(vp))return;
+	// All required buffers were checked once by viewport_readable(). Interface is optional.
+	if(vp->screentexpos_interface==nullptr)return;
 	const int32_t index=x*vp->dim_y+y;
 	const auto redraw=[&]{renderer->update_viewport_tile(vp,x,y);};
 	const auto without_visuals=[&]
@@ -841,7 +940,7 @@ void draw_proxy(df::renderer_2d_base *renderer,const render_proxyst &proxy)
 	const int32_t zoom=renderer->viewport_zoom_factor;
 	const int32_t target_x=tile_pixel(proxy.target_x,renderer->origin_x,zoom);
 	const int32_t target_y=tile_pixel(proxy.target_y,renderer->origin_y,zoom);
-	const float tile_size=float(zoom==128?32:std::max(1,zoom*32/128));
+	const float tile_size=float(tile_size_px(zoom));
 	const float source_x=target_x+(proxy.source_x-proxy.target_x)*tile_size;
 	const float source_y=target_y+(proxy.source_y-proxy.target_y)*tile_size;
 	const float mirror_offset=float(proxy.mirror_shift)*tile_size;
@@ -1123,7 +1222,7 @@ render_coveragest collect_coverage(
 	return coverage;
 }
 
-std::vector<df::graphic_viewportst *> active_viewports()
+std::vector<df::graphic_viewportst *> active_viewports(bool main_readable)
 {
 	std::vector<df::graphic_viewportst *> viewports;
 	if(gps==nullptr)return viewports;
@@ -1132,7 +1231,7 @@ std::vector<df::graphic_viewportst *> active_viewports()
 		df::graphic_viewportst *vp=gps->lower_viewport[lower];
 		if(viewport_readable(vp))viewports.push_back(vp);
 		}
-	if(viewport_readable(gps->main_viewport))
+	if(main_readable)
 		viewports.push_back(gps->main_viewport);
 	return viewports;
 }
@@ -1226,9 +1325,18 @@ bool has_mirrored_viewport_facing(
 void render_interpolated_world(df::renderer_2d_base *renderer)
 {
 	df::graphic_viewportst *vp=gps?gps->main_viewport:nullptr;
-	const std::vector<df::graphic_viewportst *> viewports=active_viewports();
+	const bool main_readable=viewport_readable(vp);
+	const std::vector<df::graphic_viewportst *> viewports=active_viewports(main_readable);
 
-	if(vp!=nullptr)update_visual_context(renderer,vp);
+	if(main_readable)update_visual_context(renderer,vp);
+	else
+		{
+		previous_coverage.clear();
+		previous_viewport=nullptr;
+		has_view_signature=false;
+		has_pan_context=false;
+		cancel_camera_transients();
+		}
 	const uint32_t now_ms=Core::getInstance().p->getTickCount();
 	animation_manager.begin_frame(
 		now_ms,
@@ -1237,12 +1345,21 @@ void render_interpolated_world(df::renderer_2d_base *renderer)
 		animation_manager.synchronize_viewport(animation_input(viewport));
 	animation_manager.end_frame();
 
-	if(!viewport_readable(vp)||renderer->sdl_renderer==nullptr)
+	if(!main_readable||renderer->sdl_renderer==nullptr)
 		return;
 	update_camera(renderer,vp,animation_manager.get_frame_delta_ms());
 	const double cam_tile=tile_px(renderer);
-	const int32_t glide_x=int32_t(std::lround(transient_x+rest_x*cam_tile));
-	const int32_t glide_y=int32_t(std::lround(transient_y+rest_y*cam_tile));
+	int32_t glide_x=0;
+	int32_t glide_y=0;
+	if(!rounded_pixel_offset(transient_x+rest_x*cam_tile,glide_x)||
+		!rounded_pixel_offset(transient_y+rest_y*cam_tile,glide_y))
+		{
+		rest_x=0.0;
+		rest_y=0.0;
+		cancel_camera_transients();
+		glide_x=0;
+		glide_y=0;
+		}
 	const bool glide=glide_x!=0||glide_y!=0;
 	if(!glide&&camera_was_offset)
 		{
@@ -1261,7 +1378,7 @@ void render_interpolated_world(df::renderer_2d_base *renderer)
 
 	SDL_Renderer *sdl_renderer=static_cast<SDL_Renderer *>(renderer->sdl_renderer);
 	const int32_t zoom=renderer->viewport_zoom_factor;
-	const int32_t tile_size=zoom==128?32:std::max(1,zoom*32/128);
+	const int32_t tile_size=tile_size_px(zoom);
 
 	if(glide)
 		{
@@ -1270,14 +1387,16 @@ void render_interpolated_world(df::renderer_2d_base *renderer)
 		// already drew this frame at the snapped position; everything here overdraws it, clipped
 		// to the map rect so shifted tiles never spill over the UI. The uncovered strip on the
 		// trailing edge stays black until the glide lands.
+		const int32_t map_left=tile_pixel(vp->clipx[0],renderer->origin_x,zoom);
+		const int32_t map_top=tile_pixel(vp->clipy[0],renderer->origin_y,zoom);
+		const int32_t map_right=tile_pixel(vp->clipx[1]+1,renderer->origin_x,zoom);
+		const int32_t map_bottom=tile_pixel(vp->clipy[1]+1,renderer->origin_y,zoom);
 		const SDL_Rect map_rect=
 			{
-			tile_pixel(vp->clipx[0],renderer->origin_x,zoom),
-			tile_pixel(vp->clipy[0],renderer->origin_y,zoom),
-			tile_pixel(vp->clipx[1]+1,renderer->origin_x,zoom)-
-				tile_pixel(vp->clipx[0],renderer->origin_x,zoom),
-			tile_pixel(vp->clipy[1]+1,renderer->origin_y,zoom)-
-				tile_pixel(vp->clipy[0],renderer->origin_y,zoom)
+			map_left,
+			map_top,
+			saturated_pixel_span(map_left,map_right),
+			saturated_pixel_span(map_top,map_bottom)
 			};
 		render_set_clip_rect(sdl_renderer,&map_rect);
 		Uint8 old_r=0,old_g=0,old_b=0,old_a=255;
@@ -1288,8 +1407,8 @@ void render_interpolated_world(df::renderer_2d_base *renderer)
 
 		const int32_t saved_origin_x=renderer->origin_x;
 		const int32_t saved_origin_y=renderer->origin_y;
-		renderer->origin_x+=glide_x;
-		renderer->origin_y+=glide_y;
+		renderer->origin_x=saturated_add(renderer->origin_x,glide_x);
+		renderer->origin_y=saturated_add(renderer->origin_y,glide_y);
 		for(int32_t x=vp->clipx[0];x<=vp->clipx[1];++x)
 			{
 			for(int32_t y=vp->clipy[0];y<=vp->clipy[1];++y)
@@ -1344,13 +1463,36 @@ IMPLEMENT_VMETHOD_INTERPOSE(renderer_hook,update_all);
 
 void renderer_hook::interpose_fn_update_all()
 {
+	assert_render_thread();
 	// update_all is the existing UI stage, so world correction must run first.
 	render_interpolated_world(this);
 	INTERPOSE_NEXT(update_all)();
 }
 
+struct sdl_bindingst
+{
+	decltype(&SDL_RenderCopyF) render_copy_f=nullptr;
+	decltype(&SDL_RenderCopyExF) render_copy_ex_f=nullptr;
+	decltype(&SDL_RenderFillRect) render_fill_rect=nullptr;
+	decltype(&SDL_RenderSetClipRect) render_set_clip_rect=nullptr;
+	decltype(&SDL_GetRenderDrawColor) get_render_draw_color=nullptr;
+	decltype(&SDL_SetRenderDrawColor) set_render_draw_color=nullptr;
+};
+
+void install_sdl_bindings(const sdl_bindingst &bindings)
+{
+	assert_render_thread();
+	render_copy_f=bindings.render_copy_f;
+	render_copy_ex_f=bindings.render_copy_ex_f;
+	render_fill_rect=bindings.render_fill_rect;
+	render_set_clip_rect=bindings.render_set_clip_rect;
+	get_render_draw_color=bindings.get_render_draw_color;
+	set_render_draw_color=bindings.set_render_draw_color;
+}
+
 void clear_sdl_bindings()
 {
+	assert_render_thread();
 	render_copy_f=nullptr;
 	render_copy_ex_f=nullptr;
 	render_fill_rect=nullptr;
@@ -1359,15 +1501,15 @@ void clear_sdl_bindings()
 	set_render_draw_color=nullptr;
 }
 
-bool load_sdl(color_ostream &out)
+bool load_sdl(color_ostream &out,sdl_bindingst &bindings)
 {
-	clear_sdl_bindings();
 	DFLibrary *sdl_handle=DFSDL::obtain_library_handle();
 	#define bind(name,target) \
-		target=reinterpret_cast<decltype(target)>(LookupPlugin(sdl_handle,#name)); \
-		if(target==nullptr) { \
+		bindings.target=reinterpret_cast<decltype(bindings.target)>( \
+			LookupPlugin(sdl_handle,#name)); \
+		if(bindings.target==nullptr) { \
 			out.printerr("smooth-movement: SDL2 function unavailable: " #name "\n"); \
-			clear_sdl_bindings(); \
+			bindings={}; \
 			return false; \
 		}
 	bind(SDL_RenderCopyF,render_copy_f);
@@ -1382,6 +1524,7 @@ bool load_sdl(color_ostream &out)
 
 void reset_state()
 {
+	assert_render_thread();
 	animation_manager=visual_animation_managerst();
 	previous_coverage.clear();
 	visual_context_revision=0;
@@ -1400,44 +1543,104 @@ void reset_state()
 	flip_enabled=false;
 }
 
+struct render_statusst
+{
+	bool camera_enabled;
+	double rest_x;
+	double rest_y;
+	bool flip_enabled;
+};
+
+bool get_render_status(color_ostream &out,render_statusst &status)
+{
+	try
+		{
+		status=render_thread_transaction([]
+			{
+			assert_render_thread();
+			return render_statusst{camera_enabled,rest_x,rest_y,flip_enabled};
+			});
+		return true;
+		}
+	catch(const std::exception &error)
+		{
+		out.printerr("smooth-movement: render transaction failed: {}\n",error.what());
+		}
+	catch(...)
+		{
+		out.printerr("smooth-movement: render transaction failed\n");
+		}
+	return false;
+}
+
+template<typename Callback>
+bool update_render_state(color_ostream &out,Callback callback)
+{
+	try
+		{
+		render_thread_transaction([callback=std::move(callback)]() mutable
+			{
+			assert_render_thread();
+			callback();
+			});
+		return true;
+		}
+	catch(const std::exception &error)
+		{
+		out.printerr("smooth-movement: render transaction failed: {}\n",error.what());
+		}
+	catch(...)
+		{
+		out.printerr("smooth-movement: render transaction failed\n");
+		}
+	return false;
+}
+
 command_result status_command(
 	color_ostream &out,
 	std::vector<std::string> &parameters)
 {
 	if(parameters.empty())
 		{
+		render_statusst status{};
+		if(!get_render_status(out,status))return CR_FAILURE;
 		out.print(
 			"smooth-movement {}: {}\n",
 			plugin_version,
 			is_enabled?"enabled":"disabled");
 		out.print("free camera: {}, offset {:.3f} {:.3f} (tiles east/south of the grid)\n",
-			camera_enabled?"on":"off",-rest_x,-rest_y);
+			status.camera_enabled?"on":"off",-status.rest_x,-status.rest_y);
 		out.print("sprite flipping: {}\n",
-			flip_enabled?"on":"off");
+			status.flip_enabled?"on":"off");
 		return CR_OK;
 		}
 	if(parameters[0]=="camera")
 		{
 		if(parameters.size()==1)
 			{
+			render_statusst status{};
+			if(!get_render_status(out,status))return CR_FAILURE;
 			out.print("free camera: {}, offset {:.3f} {:.3f}\n",
-				camera_enabled?"on":"off",-rest_x,-rest_y);
+				status.camera_enabled?"on":"off",-status.rest_x,-status.rest_y);
 			return CR_OK;
 			}
 		if(parameters.size()==2&&parameters[1]=="on")
 			{
-			set_camera_enabled(true);
+			if(!update_render_state(out,[]{set_camera_enabled(true);}))return CR_FAILURE;
 			return CR_OK;
 			}
 		if(parameters.size()==2&&parameters[1]=="off")
 			{
-			set_camera_enabled(false);
+			if(!update_render_state(out,[]{set_camera_enabled(false);}))return CR_FAILURE;
 			return CR_OK;
 			}
 		if(parameters.size()==2&&parameters[1]=="reset")
 			{
-			rest_x=0.0;
-			rest_y=0.0;
+			if(!update_render_state(out,[]
+				{
+				rest_x=0.0;
+				rest_y=0.0;
+				}))return CR_FAILURE;
 			return CR_OK;
 			}
 		if(parameters.size()==3)
@@ -1446,16 +1649,20 @@ command_result status_command(
 				{
 				const double fx=std::stod(parameters[1]);
 				const double fy=std::stod(parameters[2]);
-				if(fx<-0.99||fx>0.99||fy<-0.99||fy>0.99)
+				if(!valid_camera_offset(fx,fy))
 					{
-					out.printerr("offsets must be within -0.99..0.99 tiles\n");
+					out.printerr(
+						"offsets must be finite and within -0.99..0.99 tiles\n");
 					return CR_FAILURE;
 					}
 				// User-facing: positive = view sits east/south of the grid position.
-				set_camera_enabled(true);
-				rest_x=-fx;
-				rest_y=-fy;
-				normalize_rest();
+				if(!update_render_state(out,[fx,fy]
+					{
+					set_camera_enabled(true);
+					rest_x=-fx;
+					rest_y=-fy;
+					normalize_rest();
+					}))return CR_FAILURE;
 				return CR_OK;
 				}
 			catch(...)
@@ -1469,8 +1676,10 @@ command_result status_command(
 		{
 		if(parameters.size()==1)
 			{
+			render_statusst status{};
+			if(!get_render_status(out,status))return CR_FAILURE;
 			out.print("sprite flipping: {}\n",
-				flip_enabled?"on":"off");
+				status.flip_enabled?"on":"off");
 			return CR_OK;
 			}
 		// A toggle changes the screen without changing anything DF knows, so DF will not repaint.
@@ -1479,15 +1688,21 @@ command_result status_command(
 		// Same flush plugin_enable(false) uses.
 		if(parameters.size()==2&&parameters[1]=="on")
 			{
-			flip_enabled=true;
-			if(gps!=nullptr)++gps->force_full_display_count;
+			if(!update_render_state(out,[]
+				{
+				flip_enabled=true;
+				if(gps!=nullptr)++gps->force_full_display_count;
+				}))return CR_FAILURE;
 			out.print("smooth-movement: sprite flipping enabled\n");
 			return CR_OK;
 			}
 		if(parameters.size()==2&&parameters[1]=="off")
 			{
-			flip_enabled=false;
-			if(gps!=nullptr)++gps->force_full_display_count;
+			if(!update_render_state(out,[]
+				{
+				flip_enabled=false;
+				if(gps!=nullptr)++gps->force_full_display_count;
+				}))return CR_FAILURE;
 			out.print("smooth-movement: sprite flipping disabled\n");
 			return CR_OK;
 			}
@@ -1514,21 +1729,60 @@ DFhackCExport command_result plugin_enable(color_ostream &out,bool enable)
 	if(is_enabled==enable)return CR_OK;
 	if(enable)
 		{
-		reset_state();
-		if(!load_sdl(out))return CR_FAILURE;
-		if(!INTERPOSE_HOOK(renderer_hook,update_all).apply())
+		sdl_bindingst bindings;
+		if(!load_sdl(out,bindings))return CR_FAILURE;
+		bool applied=false;
+		try
+			{
+			applied=render_thread_transaction([bindings]
+				{
+				assert_render_thread();
+				reset_state();
+				install_sdl_bindings(bindings);
+				if(INTERPOSE_HOOK(renderer_hook,update_all).apply())return true;
+				clear_sdl_bindings();
+				return false;
+				});
+			}
+		catch(const std::exception &error)
+			{
+			out.printerr("smooth-movement: render transaction failed: {}\n",error.what());
+			return CR_FAILURE;
+			}
+		catch(...)
+			{
+			out.printerr("smooth-movement: render transaction failed\n");
+			return CR_FAILURE;
+			}
+		if(!applied)
 			{
 			out.printerr("smooth-movement: could not hook the 2D renderer\n");
-			clear_sdl_bindings();
 			return CR_FAILURE;
 			}
 		}
 	else
 		{
-		INTERPOSE_HOOK(renderer_hook,update_all).remove();
-		reset_state();
-		clear_sdl_bindings();
-		if(gps!=nullptr)++gps->force_full_display_count;
+		try
+			{
+			render_thread_transaction([]
+				{
+				assert_render_thread();
+				INTERPOSE_HOOK(renderer_hook,update_all).remove();
+				reset_state();
+				clear_sdl_bindings();
+				if(gps!=nullptr)++gps->force_full_display_count;
+				});
+			}
+		catch(const std::exception &error)
+			{
+			out.printerr("smooth-movement: render transaction failed: {}\n",error.what());
+			return CR_FAILURE;
+			}
+		catch(...)
+			{
+			out.printerr("smooth-movement: render transaction failed\n");
+			return CR_FAILURE;
+			}
 		}
 	is_enabled=enable;
 	out.print("smooth-movement: {}\n",enable?"enabled":"disabled");

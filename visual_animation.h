@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <limits>
 #include <vector>
 
 enum class viewport_visual_layer : uint8_t
@@ -139,6 +140,8 @@ struct viewport_visual_animation_inputst
 	bool valid() const
 		{
 		if(viewport==nullptr||dim_x<=0||dim_y<=0)return false;
+		if(uint64_t(dim_x)*uint64_t(dim_y)>
+			uint64_t(std::numeric_limits<int32_t>::max()))return false;
 		for(size_t layer=0;layer<current.size();++layer)
 			{
 			if(current[layer]==nullptr||previous[layer]==nullptr)return false;
@@ -159,6 +162,14 @@ struct visual_movement_renderst
 constexpr uint32_t default_movement_duration_ms=100;
 constexpr float default_game_fps=100.0f;
 constexpr uint32_t max_movement_cadence_baselines=4;
+constexpr double max_camera_offset_tiles=0.99;
+
+inline bool valid_camera_offset(double x,double y)
+{
+	return std::isfinite(x)&&std::isfinite(y)&&
+		x>=-max_camera_offset_tiles&&x<=max_camera_offset_tiles&&
+		y>=-max_camera_offset_tiles&&y<=max_camera_offset_tiles;
+}
 
 inline uint32_t movement_duration_for_fps(float game_fps)
 {

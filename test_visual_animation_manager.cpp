@@ -53,6 +53,32 @@ void run_frame(
 
 int main()
 {
+	// Camera command offsets must be safe to round before they enter render state.
+	assert(valid_camera_offset(0.0,0.0));
+	assert(valid_camera_offset(-max_camera_offset_tiles,max_camera_offset_tiles));
+	assert(!valid_camera_offset(
+		std::numeric_limits<double>::quiet_NaN(),0.0));
+	assert(!valid_camera_offset(
+		std::numeric_limits<double>::infinity(),0.0));
+	assert(!valid_camera_offset(
+		-std::numeric_limits<double>::infinity(),0.0));
+	assert(!valid_camera_offset(max_camera_offset_tiles+0.001,0.0));
+
+	// Positive dimensions are not enough: all signed tile indices also need a safe product.
+	{
+		int32_t one_tile[1]={};
+		const int viewport_token=0;
+		auto input=make_input(&viewport_token,1,one_tile);
+		assert(input.valid());
+		input.dim_x=std::numeric_limits<int32_t>::max();
+		input.dim_y=2;
+		assert(!input.valid());
+		input.dim_x=1;
+		input.dim_y=1;
+		input.current[0]=nullptr;
+		assert(!input.valid());
+	}
+
 	visual_animation_managerst manager;
 	manager.begin_frame(1000);
 	assert(manager.get_frame_time_ms()==1000);
