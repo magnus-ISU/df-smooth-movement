@@ -413,6 +413,8 @@ int main()
 	assert(manager.get_facing(gap_viewport,2,3)==native_sprite_facing);
 	}
 
+	assert(animation_progress(25,0,100)==0.25f);
+	assert(animation_progress(75,0,100)==0.75f);
 	assert(animation_progress(100,0,100)==1.0f);
 	assert(inherited_visual_source_tile(0,0,1)==-1);
 	assert(inherited_visual_source_tile(2,0,1)==1);

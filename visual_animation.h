@@ -161,9 +161,7 @@ inline float animation_progress(
 	uint32_t start_time_ms,
 	uint32_t duration_ms)
 {
-	const float linear=std::min(
-		1.0f,float(now_ms-start_time_ms)/duration_ms);
-	return linear*linear*(3.0f-2.0f*linear);
+	return std::min(1.0f,float(now_ms-start_time_ms)/duration_ms);
 }
 
 inline bool visual_moved_between_tiles(
