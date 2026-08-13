@@ -112,6 +112,17 @@ bool has_pan_context=false;
 bool flip_enabled=false;
 
 // --- free camera -------------------------------------------------------------------------------
+enum class camera_border_behaviorst : uint8_t
+{
+	retain,
+	black
+};
+
+const char *camera_border_behavior_name(camera_border_behaviorst behavior)
+{
+	return behavior==camera_border_behaviorst::black?"black":"retain";
+}
+
 // The camera is visually unbound from the tile grid. Two layered offsets:
 //   rest      -- a PERSISTENT sub-tile offset in tiles: the free camera. Set by pixel-perfect
 //                middle-mouse drag panning (the view rests wherever released, mid-tile or not)
@@ -119,12 +130,13 @@ bool flip_enabled=false;
 //                and z-level changes. Kept in [-0.5,0.5] by normalization: whole-tile parts are
 //                folded into window_x/window_y (a plain UI scroll write -- NEVER the viewport
 //                dims, which crash DF; the sub-tile strip this leaves at one screen edge has no
-//                buffer data and stays black).
+//                buffer data, so it retains the snapped frame or is cleared to black).
 //   transient -- the decaying scroll glide from before, in pixels, layered on top.
 // Render offset = transient + rest*tile. window_x/window_y remain the game's own tile camera.
 bool camera_enabled=false;                    // OFF by default: plain `enable smooth-movement`
                                               // keeps upstream behavior (creature interpolation
                                               // only); `smooth-movement camera on` opts in.
+camera_border_behaviorst camera_border_behavior=camera_border_behaviorst::retain;
 constexpr int32_t camera_max_glide_tiles=3;   // per-jump: farther than this snaps instantly
 constexpr double camera_tau_ms=35.0;          // transient catch-up (~95% done after 100ms)
 double transient_x=0.0;                       // decaying glide offset, pixels
@@ -1386,7 +1398,7 @@ void render_interpolated_world(df::renderer_2d_base *renderer)
 		// the creature proxies, which read origin at draw time) renders between tiles. The engine
 		// already drew this frame at the snapped position; everything here overdraws it, clipped
 		// to the map rect so shifted tiles never spill over the UI. The uncovered strip on the
-		// trailing edge stays black until the glide lands.
+		// trailing edge retains that snapped frame by default, or is cleared in black mode.
 		const int32_t map_left=tile_pixel(vp->clipx[0],renderer->origin_x,zoom);
 		const int32_t map_top=tile_pixel(vp->clipy[0],renderer->origin_y,zoom);
 		const int32_t map_right=tile_pixel(vp->clipx[1]+1,renderer->origin_x,zoom);
@@ -1399,11 +1411,14 @@ void render_interpolated_world(df::renderer_2d_base *renderer)
 			saturated_pixel_span(map_top,map_bottom)
 			};
 		render_set_clip_rect(sdl_renderer,&map_rect);
-		Uint8 old_r=0,old_g=0,old_b=0,old_a=255;
-		get_render_draw_color(sdl_renderer,&old_r,&old_g,&old_b,&old_a);
-		set_render_draw_color(sdl_renderer,0,0,0,255);
-		render_fill_rect(sdl_renderer,&map_rect);
-		set_render_draw_color(sdl_renderer,old_r,old_g,old_b,old_a);
+		if(camera_border_behavior==camera_border_behaviorst::black)
+			{
+			Uint8 old_r=0,old_g=0,old_b=0,old_a=255;
+			get_render_draw_color(sdl_renderer,&old_r,&old_g,&old_b,&old_a);
+			set_render_draw_color(sdl_renderer,0,0,0,255);
+			render_fill_rect(sdl_renderer,&map_rect);
+			set_render_draw_color(sdl_renderer,old_r,old_g,old_b,old_a);
+			}
 
 		const int32_t saved_origin_x=renderer->origin_x;
 		const int32_t saved_origin_y=renderer->origin_y;
@@ -1538,6 +1553,7 @@ void reset_state()
 	rest_x=0.0;
 	rest_y=0.0;
 	camera_enabled=false;
+	camera_border_behavior=camera_border_behaviorst::retain;
 	camera_has_prev=false;
 	camera_was_offset=false;
 	flip_enabled=false;
@@ -1548,6 +1564,7 @@ struct render_statusst
 	bool camera_enabled;
 	double rest_x;
 	double rest_y;
+	camera_border_behaviorst camera_border_behavior;
 	bool flip_enabled;
 };
 
@@ -1558,7 +1575,8 @@ bool get_render_status(color_ostream &out,render_statusst &status)
 		status=render_thread_transaction([]
 			{
 			assert_render_thread();
-			return render_statusst{camera_enabled,rest_x,rest_y,flip_enabled};
+			return render_statusst{
+				camera_enabled,rest_x,rest_y,camera_border_behavior,flip_enabled};
 			});
 		return true;
 		}
@@ -1610,6 +1628,8 @@ command_result status_command(
 			is_enabled?"enabled":"disabled");
 		out.print("free camera: {}, offset {:.3f} {:.3f} (tiles east/south of the grid)\n",
 			status.camera_enabled?"on":"off",-status.rest_x,-status.rest_y);
+		out.print("camera border: {}\n",
+			camera_border_behavior_name(status.camera_border_behavior));
 		out.print("sprite flipping: {}\n",
 			status.flip_enabled?"on":"off");
 		return CR_OK;
@@ -1622,6 +1642,16 @@ command_result status_command(
 			if(!get_render_status(out,status))return CR_FAILURE;
 			out.print("free camera: {}, offset {:.3f} {:.3f}\n",
 				status.camera_enabled?"on":"off",-status.rest_x,-status.rest_y);
+			out.print("camera border: {}\n",
+				camera_border_behavior_name(status.camera_border_behavior));
+			return CR_OK;
+			}
+		if(parameters.size()==2&&parameters[1]=="border")
+			{
+			render_statusst status{};
+			if(!get_render_status(out,status))return CR_FAILURE;
+			out.print("camera border: {}\n",
+				camera_border_behavior_name(status.camera_border_behavior));
 			return CR_OK;
 			}
 		if(parameters.size()==2&&parameters[1]=="on")
@@ -1641,6 +1671,22 @@ command_result status_command(
 				rest_x=0.0;
 				rest_y=0.0;
 				}))return CR_FAILURE;
+			return CR_OK;
+			}
+		if(parameters.size()==3&&parameters[1]=="border"&&
+			(parameters[2]=="retain"||parameters[2]=="black"))
+			{
+			const camera_border_behaviorst behavior=parameters[2]=="black"?
+				camera_border_behaviorst::black:
+				camera_border_behaviorst::retain;
+			if(!update_render_state(out,[behavior]
+				{
+				if(camera_border_behavior==behavior)return;
+				camera_border_behavior=behavior;
+				if(gps!=nullptr)++gps->force_full_display_count;
+				}))return CR_FAILURE;
+			out.print("smooth-movement: camera border set to {}\n",
+				camera_border_behavior_name(behavior));
 			return CR_OK;
 			}
 		if(parameters.size()==3)
@@ -1718,9 +1764,14 @@ plugin_init(color_ostream &,std::vector<PluginCommand> &commands)
 {
 	commands.emplace_back(
 		"smooth-movement",
-		"Smooth movement status; free camera: camera on|off|reset|<fx> <fy>; "
+		"Smooth movement status; free camera: camera on|off|reset|<fx> <fy> or "
+		"camera border retain|black; "
 		"sprite flipping: flip on|off.",
-		status_command);
+		status_command,
+		false,
+		// The command synchronously waits for render-thread work. Holding CoreSuspender while
+		// waiting can deadlock the simulation and render threads, and parsing/output need no core.
+		true);
 	return CR_OK;
 }
 

@@ -31,6 +31,8 @@ smooth-movement             # show plugin status
 disable smooth-movement     # disable the plugin
 smooth-movement flip on     # enable sprites flip
 smooth-movement camera on   # enable the free camera
+smooth-movement camera border retain # retain snapped edge content (default)
+smooth-movement camera border black  # clear exposed camera edges to black
 ```
 
 ## Compatibility

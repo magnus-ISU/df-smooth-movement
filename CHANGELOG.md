@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Retain the snapped camera frame under edges exposed by sub-tile camera movement
+  instead of clearing them to black. The previous black-border rendering remains
+  available with `smooth-movement camera border black`; use `retain` to switch back.
 - Scale fallback movement interpolation duration with the configured game FPS
   and infer each moving visual's cadence from consecutive steps, keeping units
   with different movement speeds continuous.
