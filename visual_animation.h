@@ -163,12 +163,51 @@ constexpr uint32_t default_movement_duration_ms=100;
 constexpr float default_game_fps=100.0f;
 constexpr uint32_t max_movement_cadence_baselines=4;
 constexpr double max_camera_offset_tiles=0.99;
+constexpr double camera_drag_rest_limit_tiles=1.5;
+constexpr double camera_drag_correction_tau_ms=120.0;
+
+struct camera_drag_axisst
+{
+	double rest_tiles=0.0;
+	double correction_px=0.0;
+};
 
 inline bool valid_camera_offset(double x,double y)
 {
 	return std::isfinite(x)&&std::isfinite(y)&&
 		x>=-max_camera_offset_tiles&&x<=max_camera_offset_tiles&&
 		y>=-max_camera_offset_tiles&&y<=max_camera_offset_tiles;
+}
+
+inline camera_drag_axisst constrain_camera_drag_axis(
+	double requested_rest_tiles,
+	double correction_px,
+	double tile_size_px)
+{
+	if(!std::isfinite(requested_rest_tiles)||!std::isfinite(correction_px)||
+		!std::isfinite(tile_size_px)||tile_size_px<=0.0)return {};
+	const double rest_tiles=std::clamp(
+		requested_rest_tiles,-camera_drag_rest_limit_tiles,camera_drag_rest_limit_tiles);
+	return {
+		rest_tiles,
+		correction_px+(requested_rest_tiles-rest_tiles)*tile_size_px
+		};
+}
+
+inline camera_drag_axisst persist_camera_drag_axis(
+	double rest_tiles,
+	double correction_px,
+	double tile_size_px)
+{
+	if(!std::isfinite(rest_tiles)||!std::isfinite(correction_px)||
+		!std::isfinite(tile_size_px)||tile_size_px<=0.0)return {};
+	return {rest_tiles+correction_px/tile_size_px,0.0};
+}
+
+inline double decay_camera_drag_correction(double correction_px,uint32_t delta_ms)
+{
+	if(!std::isfinite(correction_px))return 0.0;
+	return correction_px*std::exp(-double(delta_ms)/camera_drag_correction_tau_ms);
 }
 
 inline uint32_t movement_duration_for_fps(float game_fps)

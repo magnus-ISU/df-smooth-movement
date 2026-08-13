@@ -64,6 +64,37 @@ int main()
 		-std::numeric_limits<double>::infinity(),0.0));
 	assert(!valid_camera_offset(max_camera_offset_tiles+0.001,0.0));
 
+	// A fast drag keeps the rendered position continuous when its persistent part is bounded.
+	constexpr double tile_size=32.0;
+	for(double requested:{1.25,1.5,1.75,-1.25,-1.5,-1.75})
+		{
+		const auto constrained=constrain_camera_drag_axis(requested,0.0,tile_size);
+		assert(std::abs(
+			constrained.rest_tiles*tile_size+constrained.correction_px-
+			requested*tile_size)<0.000001);
+		assert(constrained.rest_tiles>=-camera_drag_rest_limit_tiles&&
+			constrained.rest_tiles<=camera_drag_rest_limit_tiles);
+		}
+	const auto diagonal_x=constrain_camera_drag_axis(2.0,8.0,tile_size);
+	const auto diagonal_y=constrain_camera_drag_axis(-2.25,-4.0,tile_size);
+	assert(diagonal_x.rest_tiles==camera_drag_rest_limit_tiles);
+	assert(diagonal_y.rest_tiles==-camera_drag_rest_limit_tiles);
+	assert(diagonal_x.correction_px==24.0);
+	assert(diagonal_y.correction_px==-28.0);
+
+	// Releasing persists the complete rendered offset without starting another animation.
+	const auto persisted=persist_camera_drag_axis(0.75,12.0,tile_size);
+	assert(persisted.rest_tiles==1.125);
+	assert(persisted.correction_px==0.0);
+	assert(persisted.rest_tiles*tile_size==0.75*tile_size+12.0);
+
+	// The drag correction has a 120 ms time constant while the mouse is held.
+	const double after_one_tau=decay_camera_drag_correction(32.0,120);
+	assert(std::abs(after_one_tau-32.0/std::exp(1.0))<0.000001);
+	const double after_three_tau=decay_camera_drag_correction(32.0,360);
+	assert(std::abs(after_three_tau-32.0/std::exp(3.0))<0.000001);
+	assert(after_three_tau<32.0*0.05);
+
 	// Positive dimensions are not enough: all signed tile indices also need a safe product.
 	{
 		int32_t one_tile[1]={};

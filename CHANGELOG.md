@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Replace the hard correction during fast middle-mouse dragging with an elastic
+  offset while the button is held. Releasing preserves the current fractional
+  camera position instead of continuing to drift toward the tile grid.
 - Retain the snapped camera frame under edges exposed by sub-tile camera movement
   instead of clearing them to black. The previous black-border rendering remains
   available with `smooth-movement camera border black`; use `retain` to switch back.

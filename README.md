@@ -8,7 +8,7 @@ A visual plugin for Dwarf Fortress that makes movement smoother.
 - **Synced icons:** status icons follow their creature while it moves.
 - **Animated carts:** wheelbarrows and minecarts move smoothly too.
 - **Sprites flip** creatures can optionally face the direction they are walking.
-- **Free camera:** the camera can optionally glide and be dragged with the mouse (WIP).
+- **Free camera:** the camera can optionally glide and follow middle-mouse dragging (WIP).
 
 ## Installation
 
