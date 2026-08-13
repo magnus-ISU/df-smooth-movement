@@ -158,12 +158,19 @@ struct visual_movement_renderst
 
 constexpr uint32_t default_movement_duration_ms=100;
 constexpr float default_game_fps=100.0f;
+constexpr uint32_t max_movement_cadence_baselines=4;
 
 inline uint32_t movement_duration_for_fps(float game_fps)
 {
 	if(!std::isfinite(game_fps)||game_fps<=0.0f)return default_movement_duration_ms;
 	const double duration=double(default_movement_duration_ms)*default_game_fps/game_fps;
 	return uint32_t(std::llround(std::clamp(duration,1.0,double(UINT32_MAX))));
+}
+
+inline bool valid_movement_cadence(uint32_t interval_ms,uint32_t fallback_duration_ms)
+{
+	return interval_ms!=0&&uint64_t(interval_ms)<=
+		uint64_t(fallback_duration_ms)*max_movement_cadence_baselines;
 }
 
 inline float animation_progress(
@@ -232,6 +239,15 @@ class visual_animation_managerst
 		uint32_t duration_ms;
 	};
 
+	struct movement_cadencest
+	{
+		viewport_visual_layer layer;
+		int32_t texpos;
+		int32_t tile_x;
+		int32_t tile_y;
+		uint32_t last_move_time_ms;
+	};
+
 	struct viewport_animationst
 	{
 		const void *viewport=nullptr;
@@ -241,6 +257,8 @@ class visual_animation_managerst
 		bool has_context=false;
 		bool seen=false;
 		std::vector<movementst> movements;
+		// Persists after an animation expires so the next step can reveal this visual's cadence.
+		std::vector<movement_cadencest> movement_cadences;
 		// One facing per tile, not per unit: the viewport exposes one creature texpos per tile.
 		std::vector<int8_t> facing;
 		// Stationary mirrored creatures are repainted every frame; this is the cheap pre-check.
@@ -286,6 +304,7 @@ class visual_animation_managerst
 	static void abandon_pending(viewport_animationst &state)
 		{
 		state.movements.clear();
+		state.movement_cadences.clear();
 		clear_pending(state);
 		}
 
@@ -427,9 +446,15 @@ class visual_animation_managerst
 			uint32_t now_ms,
 			uint32_t movement_duration_ms=default_movement_duration_ms)
 			{
+			movement_duration_ms=std::max(1U,movement_duration_ms);
+			if(has_frame&&frame_movement_duration_ms!=movement_duration_ms)
+				{
+				for(viewport_animationst &state:viewports)
+					state.movement_cadences.clear();
+				}
 			frame_delta_ms=has_frame?now_ms-frame_time_ms:0;
 			frame_time_ms=now_ms;
-			frame_movement_duration_ms=std::max(1U,movement_duration_ms);
+			frame_movement_duration_ms=movement_duration_ms;
 			has_frame=true;
 			force_full_redraw=false;
 			// Keep one final full redraw when the last movement expires.
@@ -571,6 +596,18 @@ class visual_animation_managerst
 									movement.target_y<0||movement.target_y>=input.dim_y;
 								}),
 						state.movements.end());
+					state.movement_cadences.erase(
+						std::remove_if(
+							state.movement_cadences.begin(),
+							state.movement_cadences.end(),
+							[&](movement_cadencest &cadence)
+								{
+								cadence.tile_x-=dwx;
+								cadence.tile_y-=dwy;
+								return cadence.tile_x<0||cadence.tile_x>=input.dim_x||
+									cadence.tile_y<0||cadence.tile_y>=input.dim_y;
+								}),
+						state.movement_cadences.end());
 					// Facing describes creatures still on screen, so translate it rather than drop it.
 					if(state.facing.size()==
 						size_t(input.dim_x)*size_t(input.dim_y))
@@ -656,6 +693,9 @@ class visual_animation_managerst
 				const int32_t tile_count=input.dim_x*input.dim_y;
 				std::vector<uint8_t> claimed_sources(tile_count);
 				const size_t existing_movement_count=state.movements.size();
+				const auto cadences_at_frame_start=state.movement_cadences;
+				std::vector<uint8_t> claimed_cadences(cadences_at_frame_start.size());
+				std::vector<movement_cadencest> new_cadences;
 				// A chained movement's source may already have been rewritten this frame.
 				const std::vector<int8_t> facing_at_frame_start=state.facing;
 				// Source clears are deferred until every movement this frame is registered.
@@ -735,6 +775,34 @@ class visual_animation_managerst
 							if(candidate_count!=1)continue;
 
 							claimed_sources[source]=1;
+							const auto visual_layer=static_cast<viewport_visual_layer>(layer);
+							const int32_t source_x=source/input.dim_y;
+							const int32_t source_y=source%input.dim_y;
+							size_t cadence_source=0;
+							int32_t cadence_count=0;
+							for(size_t i=0;i<cadences_at_frame_start.size();++i)
+								{
+								const auto &cadence=cadences_at_frame_start[i];
+								if(claimed_cadences[i]||cadence.layer!=visual_layer||
+									cadence.tile_x!=source_x||cadence.tile_y!=source_y||
+									previous[source]==0||
+									!visual_layer_matches(
+										visual_layer,previous[source],cadence.texpos))continue;
+								cadence_source=i;
+								++cadence_count;
+								}
+							uint32_t movement_duration_ms=frame_movement_duration_ms;
+							if(cadence_count==1)
+								{
+								claimed_cadences[cadence_source]=1;
+								const uint32_t interval_ms=frame_time_ms-
+									cadences_at_frame_start[cadence_source].last_move_time_ms;
+								if(valid_movement_cadence(
+									interval_ms,frame_movement_duration_ms))
+									movement_duration_ms=interval_ms;
+								}
+							new_cadences.push_back(
+								{visual_layer,texpos,x,y,frame_time_ms});
 							float visual_source_x=float(source/input.dim_y);
 							float visual_source_y=float(source%input.dim_y);
 							for(size_t i=0;i<existing_movement_count;++i)
@@ -753,14 +821,14 @@ class visual_animation_managerst
 								}
 							state.movements.push_back(
 								{
-								static_cast<viewport_visual_layer>(layer),
+								visual_layer,
 								texpos,
 								visual_source_x,
 								visual_source_y,
 								x,
 								y,
 								frame_time_ms,
-								frame_movement_duration_ms
+								movement_duration_ms
 								});
 							if(static_cast<viewport_visual_layer>(layer)==
 									viewport_visual_layer::center&&
@@ -792,6 +860,39 @@ class visual_animation_managerst
 								int8_t(native_sprite_facing);
 						}
 					}
+				std::vector<movement_cadencest> retained_cadences;
+				retained_cadences.reserve(
+					cadences_at_frame_start.size()+new_cadences.size());
+				const uint64_t max_cadence_age=uint64_t(frame_movement_duration_ms)*
+					max_movement_cadence_baselines;
+				for(size_t i=0;i<cadences_at_frame_start.size();++i)
+					{
+					if(claimed_cadences[i])continue;
+					const auto &cadence=cadences_at_frame_start[i];
+					const size_t layer=static_cast<size_t>(cadence.layer);
+					const int32_t tile=cadence.tile_x*input.dim_y+cadence.tile_y;
+					if(uint64_t(frame_time_ms-cadence.last_move_time_ms)>max_cadence_age||
+						input.current[layer][tile]==0||
+						!visual_layer_matches(
+							cadence.layer,input.current[layer][tile],cadence.texpos))continue;
+					retained_cadences.push_back(cadence);
+					}
+				for(const auto &cadence:new_cadences)
+					{
+					retained_cadences.erase(
+						std::remove_if(
+							retained_cadences.begin(),
+							retained_cadences.end(),
+							[&](const movement_cadencest &existing)
+								{
+								return existing.layer==cadence.layer&&
+									existing.tile_x==cadence.tile_x&&
+									existing.tile_y==cadence.tile_y;
+								}),
+						retained_cadences.end());
+					retained_cadences.push_back(cadence);
+					}
+				state.movement_cadences=std::move(retained_cadences);
 				}
 			state.movements.erase(
 				std::remove_if(

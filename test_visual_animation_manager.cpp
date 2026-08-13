@@ -425,6 +425,10 @@ int main()
 	assert(movement_duration_for_fps(
 		std::numeric_limits<float>::infinity())==default_movement_duration_ms);
 	assert(movement_duration_for_fps(20000.0f)==1);
+	assert(valid_movement_cadence(1,100));
+	assert(valid_movement_cadence(400,100));
+	assert(!valid_movement_cadence(0,100));
+	assert(!valid_movement_cadence(401,100));
 	assert(inherited_visual_source_tile(0,0,1)==-1);
 	assert(inherited_visual_source_tile(2,0,1)==1);
 	assert(visual_layer_descriptor(viewport_visual_layer::right).center_x==-1);
@@ -471,7 +475,7 @@ int main()
 	run_frame(movement,input,2120);
 	assert(!movement.requires_full_redraw());
 
-	// A movement keeps the duration captured when it starts, even if later frames change it.
+	// A movement keeps the duration captured when it starts, while an FPS change clears cadence.
 	visual_animation_managerst scaled;
 	current.fill(0);
 	previous.fill(0);
@@ -485,9 +489,218 @@ int main()
 	run_frame(scaled,input,4100,100);
 	render=scaled.get_movement(viewport,viewport_visual_layer::center,1,1);
 	assert(render.active&&render.progress==0.5f);
+	previous=current;
+	current.fill(0);
+	current[2*3+1]=42;
+	run_frame(scaled,input,4150,100);
+	previous=current;
+	set_layer(input,viewport_visual_layer::center,current.data(),previous.data());
 	run_frame(scaled,input,4200,100);
+	render=scaled.get_movement(viewport,viewport_visual_layer::center,2,1);
+	assert(render.active&&render.progress==0.5f);
+	run_frame(scaled,input,4250,100);
 	assert(!scaled.get_movement(
-		viewport,viewport_visual_layer::center,1,1).active);
+		viewport,viewport_visual_layer::center,2,1).active);
+
+	// Cadence survives animation expiry. The second step uses its 150ms observed interval;
+	// after more than four fallback durations idle, the following step restarts at 100ms.
+	{
+	constexpr int32_t cadence_dim=4;
+	int32_t cadence_empty[cadence_dim*cadence_dim]={};
+	int32_t at_zero[cadence_dim*cadence_dim]={};
+	int32_t at_one[cadence_dim*cadence_dim]={};
+	int32_t at_two[cadence_dim*cadence_dim]={};
+	at_zero[0*cadence_dim+1]=42;
+	at_one[1*cadence_dim+1]=42;
+	at_two[2*cadence_dim+1]=42;
+	const int cadence_token=0;
+	const void *cadence_viewport=&cadence_token;
+	visual_animation_managerst cadence;
+	auto cadence_input=make_input(cadence_viewport,cadence_dim,cadence_empty);
+	set_layer(cadence_input,viewport_visual_layer::center,cadence_empty,cadence_empty);
+	run_frame(cadence,cadence_input,4980);
+	set_layer(cadence_input,viewport_visual_layer::center,at_zero,cadence_empty);
+	run_frame(cadence,cadence_input,4990);
+	assert(!cadence.get_movement(
+		cadence_viewport,viewport_visual_layer::center,0,1).active);
+	set_layer(cadence_input,viewport_visual_layer::center,at_one,at_zero);
+	run_frame(cadence,cadence_input,5000);
+	set_layer(cadence_input,viewport_visual_layer::center,at_one,at_one);
+	run_frame(cadence,cadence_input,5050);
+	render=cadence.get_movement(
+		cadence_viewport,viewport_visual_layer::center,1,1);
+	assert(render.active&&render.progress==0.5f);
+	set_layer(cadence_input,viewport_visual_layer::center,at_one,at_one);
+	run_frame(cadence,cadence_input,5100);
+	assert(!cadence.get_movement(
+		cadence_viewport,viewport_visual_layer::center,1,1).active);
+	set_layer(cadence_input,viewport_visual_layer::center,at_two,at_one);
+	run_frame(cadence,cadence_input,5150);
+	set_layer(cadence_input,viewport_visual_layer::center,at_two,at_two);
+	run_frame(cadence,cadence_input,5225);
+	render=cadence.get_movement(
+		cadence_viewport,viewport_visual_layer::center,2,1);
+	assert(render.active&&render.progress==0.5f);
+	set_layer(cadence_input,viewport_visual_layer::center,at_one,at_two);
+	run_frame(cadence,cadence_input,5600);
+	set_layer(cadence_input,viewport_visual_layer::center,at_one,at_one);
+	run_frame(cadence,cadence_input,5650);
+	render=cadence.get_movement(
+		cadence_viewport,viewport_visual_layer::center,1,1);
+	assert(render.active&&render.progress==0.5f);
+	}
+
+	// Consecutive diagonal steps use their own observed 150, 200 and 250ms intervals.
+	{
+	constexpr int32_t cadence_dim=5;
+	int32_t cadence_empty[cadence_dim*cadence_dim]={};
+	int32_t center[cadence_dim*cadence_dim]={};
+	int32_t north_east[cadence_dim*cadence_dim]={};
+	int32_t south_east[cadence_dim*cadence_dim]={};
+	center[2*cadence_dim+2]=42;
+	north_east[3*cadence_dim+1]=42;
+	south_east[3*cadence_dim+3]=42;
+	const int cadence_token=0;
+	const void *cadence_viewport=&cadence_token;
+	visual_animation_managerst cadence;
+	auto cadence_input=make_input(cadence_viewport,cadence_dim,cadence_empty);
+	set_layer(cadence_input,viewport_visual_layer::center,center,cadence_empty);
+	run_frame(cadence,cadence_input,9990);
+	set_layer(cadence_input,viewport_visual_layer::center,north_east,center);
+	run_frame(cadence,cadence_input,10000);
+	set_layer(cadence_input,viewport_visual_layer::center,center,north_east);
+	run_frame(cadence,cadence_input,10150);
+	set_layer(cadence_input,viewport_visual_layer::center,center,center);
+	run_frame(cadence,cadence_input,10225);
+	render=cadence.get_movement(
+		cadence_viewport,viewport_visual_layer::center,2,2);
+	assert(render.active&&render.progress==0.5f);
+	set_layer(cadence_input,viewport_visual_layer::center,south_east,center);
+	run_frame(cadence,cadence_input,10350);
+	set_layer(cadence_input,viewport_visual_layer::center,south_east,south_east);
+	run_frame(cadence,cadence_input,10450);
+	render=cadence.get_movement(
+		cadence_viewport,viewport_visual_layer::center,3,3);
+	assert(render.active&&render.progress==0.5f);
+	set_layer(cadence_input,viewport_visual_layer::center,center,south_east);
+	run_frame(cadence,cadence_input,10600);
+	set_layer(cadence_input,viewport_visual_layer::center,center,center);
+	run_frame(cadence,cadence_input,10725);
+	render=cadence.get_movement(
+		cadence_viewport,viewport_visual_layer::center,2,2);
+	assert(render.active&&render.progress==0.5f);
+	}
+
+	// A context change clears cadence. Once the delayed buffer crossing settles, movement falls
+	// back to 100ms instead of inheriting the 150ms since the previous view's last step.
+	{
+	constexpr int32_t cadence_dim=4;
+	int32_t cadence_empty[cadence_dim*cadence_dim]={};
+	int32_t at_zero[cadence_dim*cadence_dim]={};
+	int32_t at_one[cadence_dim*cadence_dim]={};
+	int32_t at_two[cadence_dim*cadence_dim]={};
+	at_zero[0*cadence_dim+1]=42;
+	at_one[1*cadence_dim+1]=42;
+	at_two[2*cadence_dim+1]=42;
+	const int cadence_token=0;
+	const void *cadence_viewport=&cadence_token;
+	visual_animation_managerst cadence;
+	auto cadence_input=make_input(cadence_viewport,cadence_dim,cadence_empty);
+	set_layer(cadence_input,viewport_visual_layer::center,at_zero,cadence_empty);
+	run_frame(cadence,cadence_input,6990);
+	set_layer(cadence_input,viewport_visual_layer::center,at_one,at_zero);
+	run_frame(cadence,cadence_input,7000);
+	++cadence_input.context_revision;
+	set_layer(cadence_input,viewport_visual_layer::center,at_one,at_one);
+	run_frame(cadence,cadence_input,7010);
+	set_layer(cadence_input,viewport_visual_layer::center,at_one,cadence_empty);
+	run_frame(cadence,cadence_input,7020);
+	set_layer(cadence_input,viewport_visual_layer::center,at_two,at_one);
+	run_frame(cadence,cadence_input,7150);
+	set_layer(cadence_input,viewport_visual_layer::center,at_two,at_two);
+	run_frame(cadence,cadence_input,7200);
+	render=cadence.get_movement(
+		cadence_viewport,viewport_visual_layer::center,2,1);
+	assert(render.active&&render.progress==0.5f);
+	}
+
+	// Giving up on an unrecognized pan clears cadence before movement detection resumes.
+	{
+	constexpr int32_t cadence_dim=4;
+	int32_t cadence_empty[cadence_dim*cadence_dim]={};
+	int32_t at_zero[cadence_dim*cadence_dim]={};
+	int32_t at_one[cadence_dim*cadence_dim]={};
+	int32_t at_two[cadence_dim*cadence_dim]={};
+	int32_t unmatched_a[cadence_dim*cadence_dim]={};
+	int32_t unmatched_b[cadence_dim*cadence_dim]={};
+	at_zero[0*cadence_dim+1]=42;
+	at_one[1*cadence_dim+1]=42;
+	at_two[2*cadence_dim+1]=42;
+	unmatched_a[1*cadence_dim+1]=78;
+	unmatched_b[1*cadence_dim+1]=79;
+	const int cadence_token=0;
+	const void *cadence_viewport=&cadence_token;
+	visual_animation_managerst cadence;
+	auto cadence_input=make_input(cadence_viewport,cadence_dim,cadence_empty);
+	set_layer(cadence_input,viewport_visual_layer::center,at_zero,cadence_empty);
+	run_frame(cadence,cadence_input,7990);
+	set_layer(cadence_input,viewport_visual_layer::center,at_one,at_zero);
+	run_frame(cadence,cadence_input,8000);
+	cadence_input.pan_x=1;
+	set_layer(cadence_input,viewport_visual_layer::center,at_one,at_one);
+	run_frame(cadence,cadence_input,8010);
+	for(int32_t frame=0;frame<5;++frame)
+		{
+		set_layer(cadence_input,viewport_visual_layer::center,at_one,
+			frame%2==0?unmatched_a:unmatched_b);
+		run_frame(cadence,cadence_input,8020+uint32_t(frame)*10);
+		}
+	set_layer(cadence_input,viewport_visual_layer::center,at_one,unmatched_b);
+	run_frame(cadence,cadence_input,8070);
+	set_layer(cadence_input,viewport_visual_layer::center,at_two,at_one);
+	run_frame(cadence,cadence_input,8080);
+	set_layer(cadence_input,viewport_visual_layer::center,at_two,at_two);
+	run_frame(cadence,cadence_input,8130);
+	render=cadence.get_movement(
+		cadence_viewport,viewport_visual_layer::center,2,1);
+	assert(render.active&&render.progress==0.5f);
+	}
+
+	// Two same-sprite sources make a movement unknowable. Their histories are dropped, and the
+	// next unambiguous step from the merged target starts with the fallback duration.
+	{
+	constexpr int32_t cadence_dim=5;
+	int32_t cadence_empty[cadence_dim*cadence_dim]={};
+	int32_t starts[cadence_dim*cadence_dim]={};
+	int32_t tracked[cadence_dim*cadence_dim]={};
+	int32_t ambiguous_target[cadence_dim*cadence_dim]={};
+	int32_t next[cadence_dim*cadence_dim]={};
+	starts[0*cadence_dim+1]=42;
+	starts[3*cadence_dim+3]=42;
+	tracked[1*cadence_dim+1]=42;
+	tracked[2*cadence_dim+2]=42;
+	ambiguous_target[2*cadence_dim+1]=42;
+	next[3*cadence_dim+1]=42;
+	const int cadence_token=0;
+	const void *cadence_viewport=&cadence_token;
+	visual_animation_managerst cadence;
+	auto cadence_input=make_input(cadence_viewport,cadence_dim,cadence_empty);
+	set_layer(cadence_input,viewport_visual_layer::center,starts,cadence_empty);
+	run_frame(cadence,cadence_input,8990);
+	set_layer(cadence_input,viewport_visual_layer::center,tracked,starts);
+	run_frame(cadence,cadence_input,9000);
+	set_layer(cadence_input,viewport_visual_layer::center,ambiguous_target,tracked);
+	run_frame(cadence,cadence_input,9150);
+	assert(!cadence.get_movement(
+		cadence_viewport,viewport_visual_layer::center,2,1).active);
+	set_layer(cadence_input,viewport_visual_layer::center,next,ambiguous_target);
+	run_frame(cadence,cadence_input,9300);
+	set_layer(cadence_input,viewport_visual_layer::center,next,next);
+	run_frame(cadence,cadence_input,9350);
+	render=cadence.get_movement(
+		cadence_viewport,viewport_visual_layer::center,3,1);
+	assert(render.active&&render.progress==0.5f);
+	}
 
 	visual_animation_managerst ambiguous;
 	run_frame(ambiguous,input,2990);
@@ -602,6 +815,15 @@ int main()
 	assert(!panner.get_movement(viewport,viewport_visual_layer::center,1,1).active);
 	auto followed=panner.get_movement(viewport,viewport_visual_layer::center,0,1);
 	assert(followed.active&&followed.source_x==-1&&followed.source_y==1);
+	// Cadence follows the same translation. The next step uses the 120ms since the first one.
+	pan_previous=pan_current;
+	pan_current.fill(0);
+	pan_current[1*3+1]=42;
+	run_frame(panner,pan_input,6120);
+	pan_previous=pan_current;
+	run_frame(panner,pan_input,6180);
+	moved=panner.get_movement(viewport,viewport_visual_layer::center,1,1);
+	assert(moved.active&&moved.progress==0.5f);
 
 	// SAME-FRAME: pan announced and buffers shifted in the same call — translated immediately.
 	visual_animation_managerst same_frame;

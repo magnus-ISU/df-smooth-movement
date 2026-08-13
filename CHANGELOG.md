@@ -2,8 +2,9 @@
 
 ## Unreleased
 
-- Scale movement interpolation duration with the configured game FPS, keeping
-  movement continuous when the game runs below the default 100 FPS.
+- Scale fallback movement interpolation duration with the configured game FPS
+  and infer each moving visual's cadence from consecutive steps, keeping units
+  with different movement speeds continuous.
 - Mirror creature sprites horizontally so they face their direction of travel.
   Dwarf Fortress creature art natively faces west, so only creatures moving
   east are mirrored. Facing is sticky: only horizontal movement changes it,
