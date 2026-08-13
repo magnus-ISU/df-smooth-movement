@@ -38,6 +38,35 @@ void set_layer(
 	input.previous[index]=previous;
 }
 
+template<size_t TileCount>
+void fill_background(std::array<int32_t,TileCount> &background,int32_t seed)
+{
+	for(size_t i=0;i<TileCount;++i)background[i]=seed+int32_t(i);
+}
+
+template<size_t TileCount>
+void shift_background(
+	std::array<int32_t,TileCount> &current,
+	const std::array<int32_t,TileCount> &previous,
+	int32_t dimension,
+	int32_t dx,
+	int32_t dy,
+	int32_t exposed_seed)
+{
+	for(int32_t x=0;x<dimension;++x)
+		{
+		for(int32_t y=0;y<dimension;++y)
+			{
+			const int32_t sx=x+dx;
+			const int32_t sy=y+dy;
+			const int32_t index=x*dimension+y;
+			current[size_t(index)]=sx>=0&&sx<dimension&&sy>=0&&sy<dimension?
+				previous[size_t(sx*dimension+sy)]:
+				exposed_seed+index;
+			}
+		}
+}
+
 void run_frame(
 	visual_animation_managerst &manager,
 	const viewport_visual_animation_inputst &input,
@@ -94,6 +123,21 @@ int main()
 	const double after_three_tau=decay_camera_drag_correction(32.0,360);
 	assert(std::abs(after_three_tau-32.0/std::exp(3.0))<0.000001);
 	assert(after_three_tau<32.0*0.05);
+
+	// Starting a drag absorbs every rendered camera layer, including a follow anchor, into the
+	// baseline. Clearing the anchor afterward therefore cannot move the view.
+	const double drag_anchor=camera_drag_anchor(10.0,0.25,8.0,-2.0,16.0,tile_size);
+	assert(std::abs(drag_anchor-9.0625)<0.000001);
+	assert(std::abs(
+		(10.0-drag_anchor)*tile_size-(0.25*tile_size+8.0-2.0+16.0))<0.000001);
+
+	// Normalization scrolls are consumed before a landing can become a gameplay follow anchor.
+	const auto self_only=attribute_self_scroll_axis(1,1);
+	assert(self_only.self==1&&self_only.gameplay==0);
+	const auto mixed=attribute_self_scroll_axis(1,2);
+	assert(mixed.self==1&&mixed.gameplay==1);
+	const auto opposite=attribute_self_scroll_axis(-1,1);
+	assert(opposite.self==0&&opposite.gameplay==1);
 
 	// Positive dimensions are not enough: all signed tile indices also need a safe product.
 	{
@@ -1029,4 +1073,357 @@ int main()
 		viewport,viewport_visual_layer::vehicle,2,1);
 	assert(chained.active&&chained.source_x>0.0f&&chained.source_x<1.0f&&
 		chained.progress==0.0f);
+
+	// FOLLOW CAMERA / ADVENTURE PLAYER: the unit and camera advance southeast together,
+	// leaving the unit on the same viewport tile. Dense terrain is the authoritative evidence that
+	// the scroll landed; rebasing the old creature layer reveals the otherwise-hidden unit step.
+	{
+	constexpr int32_t follow_dim=7;
+	constexpr size_t follow_tiles=size_t(follow_dim)*size_t(follow_dim);
+	const int follow_token=0;
+	const void *follow_viewport=&follow_token;
+	std::array<int32_t,follow_tiles> follow_empty{};
+	std::array<int32_t,follow_tiles> follow_current{};
+	std::array<int32_t,follow_tiles> follow_previous{};
+	std::array<int32_t,follow_tiles> background_current{};
+	std::array<int32_t,follow_tiles> background_previous{};
+	fill_background(background_previous,1000);
+	background_current=background_previous;
+	const int32_t center=follow_dim/2;
+	follow_current[size_t(center*follow_dim+center)]=42;
+	follow_previous=follow_current;
+	auto follow_input=make_input(follow_viewport,follow_dim,follow_empty.data());
+	set_layer(follow_input,viewport_visual_layer::center,
+		follow_current.data(),follow_previous.data());
+	follow_input.current_background=background_current.data();
+	follow_input.previous_background=background_previous.data();
+
+	visual_animation_managerst follow_manager;
+	run_frame(follow_manager,follow_input,20000);
+	follow_input.pan_x=1;
+	follow_input.pan_y=1;
+	run_frame(follow_manager,follow_input,20010);
+	assert(follow_manager.get_scroll(follow_viewport).pending);
+	shift_background(background_current,background_previous,follow_dim,1,1,2000);
+	run_frame(follow_manager,follow_input,20020);
+	auto scroll=follow_manager.get_scroll(follow_viewport);
+	assert(scroll.landed&&scroll.landed_x==1&&scroll.landed_y==1&&!scroll.pending);
+	assert(scroll.follow_candidate!=no_visual_movement);
+	auto follow_move=follow_manager.get_movement(
+		follow_viewport,viewport_visual_layer::center,center,center);
+	assert(follow_move.active&&follow_move.source_x==center-1&&
+		follow_move.source_y==center-1&&
+		follow_move.movement_id==scroll.follow_candidate);
+	auto follow=follow_manager.get_follow(follow_viewport,scroll.follow_candidate);
+	assert(follow.active&&follow.offset_x==1.0f&&follow.offset_y==1.0f);
+
+	const auto assert_screen_locked=[&](visual_movement_idst movement_id)
+		{
+		const auto movement=follow_manager.get_movement(
+			follow_viewport,viewport_visual_layer::center,center,center);
+		const auto camera=follow_manager.get_follow(follow_viewport,movement_id);
+		assert(movement.active&&camera.active);
+		const float proxy_offset_x=
+			(movement.source_x-center)*(1.0f-movement.progress);
+		const float proxy_offset_y=
+			(movement.source_y-center)*(1.0f-movement.progress);
+		assert(std::abs(proxy_offset_x+camera.offset_x)<0.000001f);
+		assert(std::abs(proxy_offset_y+camera.offset_y)<0.000001f);
+		const double pixel_residual=
+			std::abs(std::lround(double(camera.offset_x)*tile_size)+
+				double(proxy_offset_x)*tile_size);
+		assert(pixel_residual<=0.5);
+		};
+	assert_screen_locked(scroll.follow_candidate);
+	run_frame(follow_manager,follow_input,20050);
+	assert_screen_locked(scroll.follow_candidate);
+
+	// A consecutive step replaces the stable anchor ID, but the new inverse displacement still
+	// exactly cancels the retargeted fractional proxy, so its screen position is continuous.
+	follow_input.pan_x=2;
+	follow_input.pan_y=2;
+	run_frame(follow_manager,follow_input,20060);
+	background_previous=background_current;
+	shift_background(background_current,background_previous,follow_dim,1,1,3000);
+	follow_previous=follow_current;
+	run_frame(follow_manager,follow_input,20070);
+	const auto chained_scroll=follow_manager.get_scroll(follow_viewport);
+	assert(chained_scroll.landed&&chained_scroll.landed_x==1&&
+		chained_scroll.landed_y==1&&
+		chained_scroll.follow_candidate!=no_visual_movement&&
+		chained_scroll.follow_candidate!=scroll.follow_candidate);
+	const auto chained_follow=
+		follow_manager.get_follow(follow_viewport,chained_scroll.follow_candidate);
+	assert(chained_follow.active&&chained_follow.offset_x>1.0f&&
+		chained_follow.offset_y>1.0f);
+	assert_screen_locked(chained_scroll.follow_candidate);
+	}
+
+	// Several compensating movers are deterministic: the center-nearest target wins, with the
+	// normal x/y scan order acting as the coordinate tie-breaker.
+	{
+	constexpr int32_t crowd_dim=7;
+	constexpr size_t crowd_tiles=size_t(crowd_dim)*size_t(crowd_dim);
+	const int anchor_token=0;
+	const void *anchor_viewport=&anchor_token;
+	std::array<int32_t,crowd_tiles> anchor_empty{};
+	std::array<int32_t,crowd_tiles> anchor_current{};
+	std::array<int32_t,crowd_tiles> anchor_previous{};
+	std::array<int32_t,crowd_tiles> terrain_current{};
+	std::array<int32_t,crowd_tiles> terrain_previous{};
+	fill_background(terrain_previous,4000);
+	terrain_current=terrain_previous;
+	for(const auto &[x,y,texpos]:{
+		std::array<int32_t,3>{1,1,41},
+		std::array<int32_t,3>{2,3,42},
+		std::array<int32_t,3>{4,3,43}})
+		anchor_current[size_t(x*crowd_dim+y)]=texpos;
+	anchor_previous=anchor_current;
+	auto anchor_input=make_input(anchor_viewport,crowd_dim,anchor_empty.data());
+	set_layer(anchor_input,viewport_visual_layer::center,
+		anchor_current.data(),anchor_previous.data());
+	anchor_input.current_background=terrain_current.data();
+	anchor_input.previous_background=terrain_previous.data();
+	visual_animation_managerst anchors;
+	run_frame(anchors,anchor_input,21000);
+	anchor_input.pan_x=1;
+	run_frame(anchors,anchor_input,21010);
+	shift_background(terrain_current,terrain_previous,crowd_dim,1,0,5000);
+	run_frame(anchors,anchor_input,21020);
+	const auto chosen_scroll=anchors.get_scroll(anchor_viewport);
+	const auto first_center_tie=anchors.get_movement(
+		anchor_viewport,viewport_visual_layer::center,2,3);
+	assert(chosen_scroll.follow_candidate!=no_visual_movement&&first_center_tie.active&&
+		chosen_scroll.follow_candidate==first_center_tie.movement_id);
+	}
+
+	// With no visual follow anchor, terrain still retires the pan and the camera uses a complete
+	// one-tile exponential fallback. Existing motion decays first; a new landing is not decayed on
+	// its creation frame.
+	{
+	constexpr int32_t fallback_dim=4;
+	constexpr size_t fallback_tiles=size_t(fallback_dim)*size_t(fallback_dim);
+	const int fallback_token=0;
+	std::array<int32_t,fallback_tiles> no_visuals{};
+	std::array<int32_t,fallback_tiles> terrain_current{};
+	std::array<int32_t,fallback_tiles> terrain_previous{};
+	fill_background(terrain_previous,6000);
+	terrain_current=terrain_previous;
+	auto fallback_input=make_input(&fallback_token,fallback_dim,no_visuals.data());
+	fallback_input.current_background=terrain_current.data();
+	fallback_input.previous_background=terrain_previous.data();
+	visual_animation_managerst fallback;
+	run_frame(fallback,fallback_input,22000);
+	fallback_input.pan_x=1;
+	run_frame(fallback,fallback_input,22010);
+	shift_background(terrain_current,terrain_previous,fallback_dim,1,0,7000);
+	run_frame(fallback,fallback_input,22020);
+	const auto fallback_scroll=fallback.get_scroll(&fallback_token);
+	assert(fallback_scroll.landed&&fallback_scroll.follow_candidate==no_visual_movement);
+	assert(camera_transient_after_landing(0.0,16,32.0)==32.0);
+	const double existing_then_new=camera_transient_after_landing(32.0,35,32.0);
+	assert(existing_then_new>43.0&&existing_then_new<44.0);
+	}
+
+	// One announced three-tile scroll can land piecemeal. The remaining debt stays pending and is
+	// exposed to drag bookkeeping in content-window coordinates.
+	{
+	constexpr int32_t partial_dim=6;
+	constexpr size_t partial_tiles=size_t(partial_dim)*size_t(partial_dim);
+	const int partial_token=0;
+	std::array<int32_t,partial_tiles> no_visuals{};
+	std::array<int32_t,partial_tiles> terrain_current{};
+	std::array<int32_t,partial_tiles> terrain_previous{};
+	fill_background(terrain_previous,8000);
+	terrain_current=terrain_previous;
+	auto partial_input=make_input(&partial_token,partial_dim,no_visuals.data());
+	partial_input.current_background=terrain_current.data();
+	partial_input.previous_background=terrain_previous.data();
+	visual_animation_managerst partial;
+	run_frame(partial,partial_input,23000);
+	partial_input.pan_x=3;
+	run_frame(partial,partial_input,23010);
+	shift_background(terrain_current,terrain_previous,partial_dim,1,0,9000);
+	run_frame(partial,partial_input,23020);
+	auto partial_scroll=partial.get_scroll(&partial_token);
+	assert(partial_scroll.landed&&partial_scroll.landed_x==1&&
+		partial_scroll.pending&&partial_scroll.pending_x==2);
+	terrain_previous=terrain_current;
+	shift_background(terrain_current,terrain_previous,partial_dim,2,0,10000);
+	run_frame(partial,partial_input,23030);
+	partial_scroll=partial.get_scroll(&partial_token);
+	assert(partial_scroll.landed&&partial_scroll.landed_x==2&&!partial_scroll.pending);
+	}
+
+	// Coalesced ordered announcements can land in one redraw, and a later reversing scroll is
+	// tracked independently instead of cancelling an already-landed prefix.
+	{
+	constexpr int32_t ordered_dim=5;
+	constexpr size_t ordered_tiles=size_t(ordered_dim)*size_t(ordered_dim);
+	const int ordered_token=0;
+	std::array<int32_t,ordered_tiles> no_visuals{};
+	std::array<int32_t,ordered_tiles> terrain_current{};
+	std::array<int32_t,ordered_tiles> terrain_previous{};
+	fill_background(terrain_previous,11000);
+	terrain_current=terrain_previous;
+	auto ordered_input=make_input(&ordered_token,ordered_dim,no_visuals.data());
+	ordered_input.current_background=terrain_current.data();
+	ordered_input.previous_background=terrain_previous.data();
+	visual_animation_managerst ordered;
+	run_frame(ordered,ordered_input,24000);
+	ordered_input.pan_x=1;
+	run_frame(ordered,ordered_input,24010);
+	ordered_input.pan_x=2;
+	run_frame(ordered,ordered_input,24020);
+	shift_background(terrain_current,terrain_previous,ordered_dim,2,0,12000);
+	run_frame(ordered,ordered_input,24030);
+	auto ordered_scroll=ordered.get_scroll(&ordered_token);
+	assert(ordered_scroll.landed&&ordered_scroll.landed_x==2&&!ordered_scroll.pending);
+	ordered_input.pan_x=1;
+	run_frame(ordered,ordered_input,24040);
+	terrain_previous=terrain_current;
+	shift_background(terrain_current,terrain_previous,ordered_dim,-1,0,13000);
+	run_frame(ordered,ordered_input,24050);
+	ordered_scroll=ordered.get_scroll(&ordered_token);
+	assert(ordered_scroll.landed&&ordered_scroll.landed_x==-1&&!ordered_scroll.pending);
+	}
+
+	// Reversing announcements remain ordered while both are pending; their signed total is zero,
+	// but the first landed buffer shift must still retire only the first event.
+	{
+	constexpr int32_t reversing_dim=5;
+	constexpr size_t reversing_tiles=size_t(reversing_dim)*size_t(reversing_dim);
+	const int reversing_token=0;
+	std::array<int32_t,reversing_tiles> no_visuals{};
+	std::array<int32_t,reversing_tiles> terrain_current{};
+	std::array<int32_t,reversing_tiles> terrain_previous{};
+	fill_background(terrain_previous,16000);
+	terrain_current=terrain_previous;
+	auto reversing_input=
+		make_input(&reversing_token,reversing_dim,no_visuals.data());
+	reversing_input.current_background=terrain_current.data();
+	reversing_input.previous_background=terrain_previous.data();
+	visual_animation_managerst reversing;
+	run_frame(reversing,reversing_input,24500);
+	reversing_input.pan_x=1;
+	run_frame(reversing,reversing_input,24510);
+	reversing_input.pan_x=0;
+	run_frame(reversing,reversing_input,24520);
+	shift_background(terrain_current,terrain_previous,reversing_dim,1,0,17000);
+	run_frame(reversing,reversing_input,24530);
+	auto reversing_scroll=reversing.get_scroll(&reversing_token);
+	assert(reversing_scroll.landed&&reversing_scroll.landed_x==1&&
+		reversing_scroll.pending&&reversing_scroll.pending_x==-1);
+	terrain_previous=terrain_current;
+	shift_background(terrain_current,terrain_previous,reversing_dim,-1,0,18000);
+	run_frame(reversing,reversing_input,24540);
+	reversing_scroll=reversing.get_scroll(&reversing_token);
+	assert(reversing_scroll.landed&&reversing_scroll.landed_x==-1&&
+		!reversing_scroll.pending);
+	}
+
+	// Uniform terrain may make a shift observable before DF swaps buffers. Accepting it early is
+	// visually equivalent and prevents pending suppression from sticking. Empty terrain has no
+	// evidence and abandons safely; excessive debt also abandons and requests a snap.
+	{
+	constexpr int32_t edge_dim=4;
+	constexpr size_t edge_tiles=size_t(edge_dim)*size_t(edge_dim);
+	const int uniform_token=0,uniform_sprite_token=0,empty_token=0,debt_token=0,
+		queue_token=0,aged_token=0;
+	std::array<int32_t,edge_tiles> no_visuals{};
+	std::array<int32_t,edge_tiles> uniform_current{};
+	std::array<int32_t,edge_tiles> uniform_previous{};
+	uniform_current.fill(77);
+	uniform_previous=uniform_current;
+	auto uniform_input=make_input(&uniform_token,edge_dim,no_visuals.data());
+	uniform_input.current_background=uniform_current.data();
+	uniform_input.previous_background=uniform_previous.data();
+	visual_animation_managerst uniform;
+	run_frame(uniform,uniform_input,25000);
+	uniform_input.pan_x=1;
+	run_frame(uniform,uniform_input,25010);
+	const auto uniform_scroll=uniform.get_scroll(&uniform_token);
+	assert(uniform_scroll.landed&&uniform_scroll.landed_x==1&&!uniform_scroll.pending);
+
+	std::array<int32_t,edge_tiles> uniform_sprite_current{};
+	std::array<int32_t,edge_tiles> uniform_sprite_previous{};
+	uniform_sprite_current[2*edge_dim+1]=42;
+	uniform_sprite_previous=uniform_sprite_current;
+	auto uniform_sprite_input=
+		make_input(&uniform_sprite_token,edge_dim,no_visuals.data());
+	set_layer(uniform_sprite_input,viewport_visual_layer::center,
+		uniform_sprite_current.data(),uniform_sprite_previous.data());
+	uniform_sprite_input.current_background=uniform_current.data();
+	uniform_sprite_input.previous_background=uniform_previous.data();
+	visual_animation_managerst uniform_sprite;
+	run_frame(uniform_sprite,uniform_sprite_input,25020);
+	uniform_sprite_input.pan_x=1;
+	run_frame(uniform_sprite,uniform_sprite_input,25030);
+	auto uniform_sprite_scroll=uniform_sprite.get_scroll(&uniform_sprite_token);
+	assert(!uniform_sprite_scroll.landed&&uniform_sprite_scroll.pending);
+	uniform_sprite_previous=uniform_sprite_current;
+	uniform_sprite_current.fill(0);
+	uniform_sprite_current[1*edge_dim+1]=42;
+	run_frame(uniform_sprite,uniform_sprite_input,25040);
+	uniform_sprite_scroll=uniform_sprite.get_scroll(&uniform_sprite_token);
+	assert(uniform_sprite_scroll.landed&&!uniform_sprite_scroll.pending);
+	assert(!uniform_sprite.get_movement(
+		&uniform_sprite_token,viewport_visual_layer::center,1,1).active);
+
+	std::array<int32_t,edge_tiles> empty_background{};
+	auto empty_input=make_input(&empty_token,edge_dim,no_visuals.data());
+	empty_input.current_background=empty_background.data();
+	empty_input.previous_background=empty_background.data();
+	visual_animation_managerst empty_scroll;
+	run_frame(empty_scroll,empty_input,25100);
+	empty_input.pan_x=1;
+	run_frame(empty_scroll,empty_input,25110);
+	assert(empty_scroll.get_scroll(&empty_token).abandoned);
+
+	std::array<int32_t,edge_tiles> debt_background{};
+	fill_background(debt_background,14000);
+	auto debt_input=make_input(&debt_token,edge_dim,no_visuals.data());
+	debt_input.current_background=debt_background.data();
+	debt_input.previous_background=debt_background.data();
+	visual_animation_managerst debt;
+	run_frame(debt,debt_input,25200);
+	debt_input.pan_x=7;
+	run_frame(debt,debt_input,25210);
+	const auto debt_scroll=debt.get_scroll(&debt_token);
+	assert(debt_scroll.abandoned&&!debt_scroll.pending);
+
+	std::array<int32_t,edge_tiles> queue_background{};
+	fill_background(queue_background,19000);
+	auto queue_input=make_input(&queue_token,edge_dim,no_visuals.data());
+	queue_input.current_background=queue_background.data();
+	queue_input.previous_background=queue_background.data();
+	visual_animation_managerst queue_limit;
+	run_frame(queue_limit,queue_input,25220);
+	for(int32_t frame=1;frame<=8;++frame)
+		{
+		queue_input.pan_x=frame%2;
+		run_frame(queue_limit,queue_input,25220+uint32_t(frame));
+		assert(!queue_limit.get_scroll(&queue_token).abandoned);
+		}
+	queue_input.pan_x=1;
+	run_frame(queue_limit,queue_input,25229);
+	const auto queue_scroll=queue_limit.get_scroll(&queue_token);
+	assert(queue_scroll.abandoned&&queue_scroll.pending&&queue_scroll.pending_x==1);
+
+	std::array<int32_t,edge_tiles> aged_background{};
+	fill_background(aged_background,15000);
+	auto aged_input=make_input(&aged_token,edge_dim,no_visuals.data());
+	aged_input.current_background=aged_background.data();
+	aged_input.previous_background=aged_background.data();
+	visual_animation_managerst aged;
+	run_frame(aged,aged_input,25300);
+	aged_input.pan_x=1;
+	run_frame(aged,aged_input,25301); // pending age 1
+	for(uint32_t frame=2;frame<=120;++frame)
+		run_frame(aged,aged_input,25300+frame);
+	assert(aged.get_scroll(&aged_token).pending);
+	run_frame(aged,aged_input,25421);
+	const auto aged_scroll=aged.get_scroll(&aged_token);
+	assert(aged_scroll.abandoned&&!aged_scroll.pending);
+	}
 }

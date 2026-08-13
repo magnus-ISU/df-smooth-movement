@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Keep a followed unit (including the Adventure player) screen-locked while the
+  camera glides by sharing scroll detection with unit interpolation and deriving
+  the camera offset from the compensating visual movement.
 - Replace the hard correction during fast middle-mouse dragging with an elastic
   offset while the button is held. Releasing preserves the current fractional
   camera position instead of continuing to drift toward the tile grid.
