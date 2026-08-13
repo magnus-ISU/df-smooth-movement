@@ -1230,7 +1230,9 @@ void render_interpolated_world(df::renderer_2d_base *renderer)
 
 	if(vp!=nullptr)update_visual_context(renderer,vp);
 	const uint32_t now_ms=Core::getInstance().p->getTickCount();
-	animation_manager.begin_frame(now_ms);
+	animation_manager.begin_frame(
+		now_ms,
+		movement_duration_for_fps(enabler?enabler->fps:default_game_fps));
 	for(df::graphic_viewportst *viewport:viewports)
 		animation_manager.synchronize_viewport(animation_input(viewport));
 	animation_manager.end_frame();

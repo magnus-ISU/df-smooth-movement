@@ -41,9 +41,10 @@ void set_layer(
 void run_frame(
 	visual_animation_managerst &manager,
 	const viewport_visual_animation_inputst &input,
-	uint32_t now_ms)
+	uint32_t now_ms,
+	uint32_t movement_duration_ms=default_movement_duration_ms)
 {
-	manager.begin_frame(now_ms);
+	manager.begin_frame(now_ms,movement_duration_ms);
 	manager.synchronize_viewport(input);
 	manager.end_frame();
 }
@@ -416,6 +417,14 @@ int main()
 	assert(animation_progress(25,0,100)==0.25f);
 	assert(animation_progress(75,0,100)==0.75f);
 	assert(animation_progress(100,0,100)==1.0f);
+	assert(movement_duration_for_fps(50.0f)==200);
+	assert(movement_duration_for_fps(100.0f)==100);
+	assert(movement_duration_for_fps(200.0f)==50);
+	assert(movement_duration_for_fps(0.0f)==default_movement_duration_ms);
+	assert(movement_duration_for_fps(-1.0f)==default_movement_duration_ms);
+	assert(movement_duration_for_fps(
+		std::numeric_limits<float>::infinity())==default_movement_duration_ms);
+	assert(movement_duration_for_fps(20000.0f)==1);
 	assert(inherited_visual_source_tile(0,0,1)==-1);
 	assert(inherited_visual_source_tile(2,0,1)==1);
 	assert(visual_layer_descriptor(viewport_visual_layer::right).center_x==-1);
@@ -461,6 +470,24 @@ int main()
 
 	run_frame(movement,input,2120);
 	assert(!movement.requires_full_redraw());
+
+	// A movement keeps the duration captured when it starts, even if later frames change it.
+	visual_animation_managerst scaled;
+	current.fill(0);
+	previous.fill(0);
+	set_layer(input,viewport_visual_layer::center,current.data(),previous.data());
+	run_frame(scaled,input,3990,200);
+	previous[0*3+1]=42;
+	current[1*3+1]=42;
+	run_frame(scaled,input,4000,200);
+	previous=current;
+	set_layer(input,viewport_visual_layer::center,current.data(),previous.data());
+	run_frame(scaled,input,4100,100);
+	render=scaled.get_movement(viewport,viewport_visual_layer::center,1,1);
+	assert(render.active&&render.progress==0.5f);
+	run_frame(scaled,input,4200,100);
+	assert(!scaled.get_movement(
+		viewport,viewport_visual_layer::center,1,1).active);
 
 	visual_animation_managerst ambiguous;
 	run_frame(ambiguous,input,2990);

@@ -156,6 +156,16 @@ struct visual_movement_renderst
 	bool inherited=false;
 };
 
+constexpr uint32_t default_movement_duration_ms=100;
+constexpr float default_game_fps=100.0f;
+
+inline uint32_t movement_duration_for_fps(float game_fps)
+{
+	if(!std::isfinite(game_fps)||game_fps<=0.0f)return default_movement_duration_ms;
+	const double duration=double(default_movement_duration_ms)*default_game_fps/game_fps;
+	return uint32_t(std::llround(std::clamp(duration,1.0,double(UINT32_MAX))));
+}
+
 inline float animation_progress(
 	uint32_t now_ms,
 	uint32_t start_time_ms,
@@ -219,6 +229,7 @@ class visual_animation_managerst
 		int32_t target_x;
 		int32_t target_y;
 		uint32_t start_time_ms;
+		uint32_t duration_ms;
 	};
 
 	struct viewport_animationst
@@ -255,11 +266,11 @@ class visual_animation_managerst
 
 	uint32_t frame_time_ms=0;
 	uint32_t frame_delta_ms=0;
+	uint32_t frame_movement_duration_ms=default_movement_duration_ms;
 	bool has_frame=false;
 	bool force_full_redraw=false;
 	std::vector<viewport_animationst> viewports;
 
-	static constexpr uint32_t movement_duration_ms=100;
 	// Scrolling faster than detection keeps up: give up rather than test ever more prefixes.
 	static constexpr size_t max_pending_shifts=8;
 	// Bounds the wait on a scroll that never lands, so suppression cannot stick forever.
@@ -403,19 +414,22 @@ class visual_animation_managerst
 		return viewports.back();
 		}
 
-	float movement_progress(uint32_t start_time_ms) const
+	float movement_progress(const movementst &movement) const
 		{
 		return animation_progress(
-			frame_time_ms,start_time_ms,movement_duration_ms);
+			frame_time_ms,movement.start_time_ms,movement.duration_ms);
 		}
 
 	public:
 		visual_animation_managerst()=default;
 
-		void begin_frame(uint32_t now_ms)
+		void begin_frame(
+			uint32_t now_ms,
+			uint32_t movement_duration_ms=default_movement_duration_ms)
 			{
 			frame_delta_ms=has_frame?now_ms-frame_time_ms:0;
 			frame_time_ms=now_ms;
+			frame_movement_duration_ms=std::max(1U,movement_duration_ms);
 			has_frame=true;
 			force_full_redraw=false;
 			// Keep one final full redraw when the last movement expires.
@@ -730,8 +744,7 @@ class visual_animation_managerst
 										static_cast<viewport_visual_layer>(layer)||
 									movement.target_x!=visual_source_x||
 									movement.target_y!=visual_source_y)continue;
-								const float progress=
-									movement_progress(movement.start_time_ms);
+								const float progress=movement_progress(movement);
 								visual_source_x=movement.source_x+
 									(movement.target_x-movement.source_x)*progress;
 								visual_source_y=movement.source_y+
@@ -746,7 +759,8 @@ class visual_animation_managerst
 								visual_source_y,
 								x,
 								y,
-								frame_time_ms
+								frame_time_ms,
+								frame_movement_duration_ms
 								});
 							if(static_cast<viewport_visual_layer>(layer)==
 									viewport_visual_layer::center&&
@@ -788,7 +802,7 @@ class visual_animation_managerst
 						const size_t layer=static_cast<size_t>(movement.layer);
 						const int32_t target=movement.target_x*input.dim_y+movement.target_y;
 						const int32_t current=input.current[layer][target];
-						return frame_time_ms-movement.start_time_ms>=movement_duration_ms||
+						return frame_time_ms-movement.start_time_ms>=movement.duration_ms||
 							current==0||
 							!visual_layer_matches(movement.layer,current,movement.texpos);
 						}),
@@ -887,7 +901,7 @@ class visual_animation_managerst
 							true,
 							movement.source_x,
 							movement.source_y,
-							movement_progress(movement.start_time_ms)
+							movement_progress(movement)
 							};
 						}
 					if(layer==viewport_visual_layer::vehicle||
@@ -900,7 +914,8 @@ class visual_animation_managerst
 							movement.source_x-movement.target_x||
 						companion->source_y-companion->target_y!=
 							movement.source_y-movement.target_y||
-						companion->start_time_ms!=movement.start_time_ms))
+						companion->start_time_ms!=movement.start_time_ms||
+						companion->duration_ms!=movement.duration_ms))
 						ambiguous=true;
 					else if(companion==nullptr)
 						companion=&movement;
@@ -911,7 +926,7 @@ class visual_animation_managerst
 						true,
 						target_x+companion->source_x-companion->target_x,
 						target_y+companion->source_y-companion->target_y,
-						movement_progress(companion->start_time_ms),
+						movement_progress(*companion),
 						true
 						};
 				break;
